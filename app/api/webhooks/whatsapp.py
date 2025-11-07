@@ -7,8 +7,11 @@ from app.config import settings
 from app.services.whatsapp import whatsapp_service
 from app.services.commands import parse_command, CommandType
 from app.services.payrant import payrant_service
+from app.services.wallet import wallet_service
+from app.services.topupmate import topupmate_service
 from app.models.webhook_log import WebhookLog, WebhookSource
 from app.models.user import User
+from app.models.transaction import TransactionType, TransactionStatus
 from app.database import SessionLocal
 from app.crud.user import get_or_create_user, get_user_by_phone, get_user_transactions
 from app.utils.helpers import format_currency
@@ -411,78 +414,332 @@ async def handle_balance_check(from_number: str):
 
 async def handle_airtime_purchase(from_number: str, parsed: dict):
     """Handle airtime purchase request"""
-    amount = parsed.get("amount")
-    phone = parsed.get("phone_number", from_number)
-    
-    if not amount:
-        # Ask for amount
+    db = SessionLocal()
+    try:
+        # Get user
+        user = get_user_by_phone(db, from_number)
+        if not user:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message="❌ Please send 'hi' to register first."
+            )
+            return
+        
+        amount = parsed.get("amount")
+        phone = parsed.get("phone_number", from_number)
+        network = parsed.get("network")
+        
+        if not amount:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    "📱 *Airtime Purchase*\n\n"
+                    "How much airtime would you like to buy?\n\n"
+                    "Example: 'Buy 1000 airtime for 08012345678'\n\n"
+                    "Min: ₦50 | Max: ₦50,000"
+                )
+            )
+            return
+        
+        # Check for errors
+        if "error" in parsed:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=f"❌ {parsed['error']}"
+            )
+            return
+        
+        # Detect network from phone number if not specified
+        if not network:
+            phone_prefix = phone[3:6] if phone.startswith("234") else phone[:4]
+            network_map = {
+                "0803": "MTN", "0806": "MTN", "0810": "MTN", "0813": "MTN", "0814": "MTN",
+                "0816": "MTN", "0903": "MTN", "0906": "MTN", "0913": "MTN", "0916": "MTN",
+                "0805": "GLO", "0807": "GLO", "0811": "GLO", "0815": "GLO", "0905": "GLO",
+                "0802": "AIRTEL", "0808": "AIRTEL", "0812": "AIRTEL", "0902": "AIRTEL", "0907": "AIRTEL",
+                "0809": "9MOBILE", "0817": "9MOBILE", "0818": "9MOBILE", "0909": "9MOBILE"
+            }
+            network = network_map.get(phone_prefix, "MTN")  # Default to MTN
+        
+        # Check wallet balance
+        balance_check = wallet_service.check_sufficient_balance(db, user.id, amount)
+        if not balance_check["has_sufficient_balance"]:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"❌ *Insufficient Balance*\n\n"
+                    f"Required: {format_currency(amount)}\n"
+                    f"Available: {format_currency(balance_check['current_balance'])}\n"
+                    f"Shortfall: {balance_check['shortfall_formatted']}\n\n"
+                    f"💡 Type *balance* to fund your wallet"
+                )
+            )
+            return
+        
+        # Send processing message
         await whatsapp_service.send_text_message(
             to=from_number,
             message=(
-                "📱 *Airtime Purchase*\n\n"
-                "How much airtime would you like to buy?\n\n"
-                "Example: 'Buy 1000 airtime'\n\n"
-                "Min: ₦50 | Max: ₦50,000"
+                f"⏳ *Processing Airtime Purchase...*\n\n"
+                f"Amount: {format_currency(amount)}\n"
+                f"Phone: {phone}\n"
+                f"Network: {network}\n\n"
+                f"Please wait..."
             )
         )
-        return
+        
+        # Debit wallet
+        transaction = wallet_service.debit_wallet(
+            db=db,
+            user_id=user.id,
+            amount=amount,
+            description=f"Airtime purchase - {phone}",
+            transaction_type=TransactionType.AIRTIME
+        )
+        
+        # Store transaction details
+        transaction.recipient_phone = phone
+        transaction.network = network
+        transaction.service_provider = "TopUpMate"
+        db.commit()
+        
+        # Purchase airtime from TopUpMate
+        result = await topupmate_service.buy_airtime(
+            phone_number=phone,
+            amount=amount,
+            network=network
+        )
+        
+        if result.get("success"):
+            # Update transaction status
+            wallet_service.update_transaction_status(
+                db=db,
+                transaction_id=transaction.id,
+                status=TransactionStatus.COMPLETED,
+                provider_response=str(result),
+                provider_reference=result.get("provider_reference")
+            )
+            
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"✅ *Airtime Purchase Successful!*\n\n"
+                    f"Amount: {format_currency(amount)}\n"
+                    f"Phone: {phone}\n"
+                    f"Network: {network}\n"
+                    f"Reference: {transaction.reference}\n\n"
+                    f"New Balance: {format_currency(user.wallet_balance)}\n\n"
+                    f"Thank you for using ForBill! 💚"
+                )
+            )
+        else:
+            # Refund on failure
+            wallet_service.refund_transaction(
+                db=db,
+                transaction_id=transaction.id,
+                reason=result.get("message", "Purchase failed")
+            )
+            
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"❌ *Airtime Purchase Failed*\n\n"
+                    f"{result.get('message')}\n\n"
+                    f"Your wallet has been refunded.\n"
+                    f"Reference: {transaction.reference}\n\n"
+                    f"Please try again or contact support."
+                )
+            )
     
-    # Check for errors
-    if "error" in parsed:
+    except Exception as e:
+        logger.error(f"Error processing airtime purchase: {str(e)}")
         await whatsapp_service.send_text_message(
             to=from_number,
-            message=f"❌ {parsed['error']}"
+            message="❌ An error occurred. Please try again later."
         )
-        return
-    
-    # Confirm purchase
-    confirmation_msg = (
-        f"📱 *Confirm Airtime Purchase*\n\n"
-        f"Amount: ₦{amount:,}\n"
-        f"Phone: {phone}\n\n"
-        f"_Coming soon! We're still setting up payment processing._\n\n"
-        f"Type 'help' for other available commands."
-    )
-    await whatsapp_service.send_text_message(
-        to=from_number,
-        message=confirmation_msg
-    )
+    finally:
+        db.close()
 
 
 async def handle_data_purchase(from_number: str, parsed: dict):
     """Handle data bundle purchase request"""
-    network = parsed.get("network")
-    data_size = parsed.get("data_size_display")
-    
-    if not network or not data_size:
-        # Show data options
+    db = SessionLocal()
+    try:
+        # Get user
+        user = get_user_by_phone(db, from_number)
+        if not user:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message="❌ Please send 'hi' to register first."
+            )
+            return
+        
+        network = parsed.get("network")
+        data_size_mb = parsed.get("data_size_mb")
+        phone = parsed.get("phone_number", from_number)
+        
+        if not network or not data_size_mb:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    "📶 *Data Bundles*\n\n"
+                    "Which network and plan would you like?\n\n"
+                    "*Examples:*\n"
+                    "• Buy 1GB MTN\n"
+                    "• 2GB Airtel for 08012345678\n"
+                    "• 500MB Glo\n\n"
+                    "*Networks:* MTN, Airtel, Glo, 9mobile"
+                )
+            )
+            return
+        
+        # Send "fetching plans" message
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message=f"📶 Fetching {network.upper()} data plans..."
+        )
+        
+        # Get data plans
+        plans_result = await topupmate_service.get_data_plans(network=network)
+        
+        if not plans_result.get("success") or not plans_result.get("plans"):
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message="❌ Unable to fetch data plans. Please try again."
+            )
+            return
+        
+        # Find matching plan (exact match or closest size)
+        plans = plans_result["plans"]
+        matching_plan = None
+        
+        # Try exact match first
+        for plan in plans:
+            plan_size = plan.get("size_mb", 0)
+            if plan_size == data_size_mb:
+                matching_plan = plan
+                break
+        
+        # If no exact match, find closest
+        if not matching_plan:
+            sorted_plans = sorted(plans, key=lambda p: abs(p.get("size_mb", 0) - data_size_mb))
+            if sorted_plans:
+                matching_plan = sorted_plans[0]
+        
+        if not matching_plan:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=f"❌ No matching data plan found for {parsed.get('data_size_display')}"
+            )
+            return
+        
+        plan_id = matching_plan["plan_id"]
+        plan_name = matching_plan["name"]
+        plan_amount = matching_plan["price"]
+        
+        # Check wallet balance
+        balance_check = wallet_service.check_sufficient_balance(db, user.id, plan_amount)
+        if not balance_check["has_sufficient_balance"]:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"❌ *Insufficient Balance*\n\n"
+                    f"Plan: {plan_name}\n"
+                    f"Required: {format_currency(plan_amount)}\n"
+                    f"Available: {format_currency(balance_check['current_balance'])}\n"
+                    f"Shortfall: {balance_check['shortfall_formatted']}\n\n"
+                    f"� Type *balance* to fund your wallet"
+                )
+            )
+            return
+        
+        # Send processing message
         await whatsapp_service.send_text_message(
             to=from_number,
             message=(
-                "📶 *Data Bundles*\n\n"
-                "Which network and plan would you like?\n\n"
-                "*Examples:*\n"
-                "• Buy 1GB MTN\n"
-                "• 2GB Airtel\n"
-                "• 500MB Glo\n\n"
-                "*Networks:* MTN, Airtel, Glo, 9mobile"
+                f"⏳ *Processing Data Purchase...*\n\n"
+                f"Plan: {plan_name}\n"
+                f"Amount: {format_currency(plan_amount)}\n"
+                f"Phone: {phone}\n"
+                f"Network: {network.upper()}\n\n"
+                f"Please wait..."
             )
         )
-        return
+        
+        # Debit wallet
+        transaction = wallet_service.debit_wallet(
+            db=db,
+            user_id=user.id,
+            amount=plan_amount,
+            description=f"Data purchase - {plan_name}",
+            transaction_type=TransactionType.DATA
+        )
+        
+        # Store transaction details
+        transaction.recipient_phone = phone
+        transaction.network = network.upper()
+        transaction.plan_id = plan_id
+        transaction.plan_name = plan_name
+        transaction.service_provider = "TopUpMate"
+        db.commit()
+        
+        # Purchase data from TopUpMate
+        result = await topupmate_service.buy_data(
+            phone_number=phone,
+            plan_id=plan_id,
+            network=network
+        )
+        
+        if result.get("success"):
+            # Update transaction status
+            wallet_service.update_transaction_status(
+                db=db,
+                transaction_id=transaction.id,
+                status=TransactionStatus.COMPLETED,
+                provider_response=str(result),
+                provider_reference=result.get("provider_reference")
+            )
+            
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"✅ *Data Purchase Successful!*\n\n"
+                    f"Plan: {plan_name}\n"
+                    f"Amount: {format_currency(plan_amount)}\n"
+                    f"Phone: {phone}\n"
+                    f"Network: {network.upper()}\n"
+                    f"Reference: {transaction.reference}\n\n"
+                    f"New Balance: {format_currency(user.wallet_balance)}\n\n"
+                    f"Thank you for using ForBill! 💚"
+                )
+            )
+        else:
+            # Refund on failure
+            wallet_service.refund_transaction(
+                db=db,
+                transaction_id=transaction.id,
+                reason=result.get("message", "Purchase failed")
+            )
+            
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"❌ *Data Purchase Failed*\n\n"
+                    f"{result.get('message')}\n\n"
+                    f"Your wallet has been refunded.\n"
+                    f"Reference: {transaction.reference}\n\n"
+                    f"Please try again or contact support."
+                )
+            )
     
-    # Show confirmation
-    confirmation_msg = (
-        f"📶 *Confirm Data Purchase*\n\n"
-        f"Network: {network.upper()}\n"
-        f"Data: {data_size}\n"
-        f"Phone: {parsed.get('phone_number', from_number)}\n\n"
-        f"_Coming soon! We're still setting up the data service._\n\n"
-        f"Type 'help' for other commands."
-    )
-    await whatsapp_service.send_text_message(
-        to=from_number,
-        message=confirmation_msg
-    )
+    except Exception as e:
+        logger.error(f"Error processing data purchase: {str(e)}")
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message="❌ An error occurred. Please try again later."
+        )
+    finally:
+        db.close()
 
 
 async def handle_electricity_payment(from_number: str, parsed: dict):
