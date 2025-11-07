@@ -71,6 +71,6 @@ async def health_check():
     return {"status": "healthy", "app": settings.APP_NAME}
 
 
-# Import and include routers (will be created in next tasks)
-# from app.api.webhooks import whatsapp
-# app.include_router(whatsapp.router, prefix="/webhook", tags=["webhooks"])
+# Import and include routers
+from app.api.webhooks import router as webhooks_router
+app.include_router(webhooks_router)
