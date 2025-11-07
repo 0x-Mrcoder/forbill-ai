@@ -7,7 +7,10 @@ from app.config import settings
 from app.services.whatsapp import whatsapp_service
 from app.services.commands import parse_command, CommandType
 from app.models.webhook_log import WebhookLog, WebhookSource
+from app.models.user import User
 from app.database import SessionLocal
+from app.crud.user import get_or_create_user, get_user_by_phone, get_user_transactions
+from app.utils.helpers import format_currency
 import json
 
 router = APIRouter()
@@ -94,7 +97,7 @@ async def receive_webhook(request: Request):
 
 async def process_incoming_message(message: dict, value: dict):
     """
-    Process an incoming WhatsApp message
+    Process an incoming WhatsApp message with user registration
     
     Args:
         message: Message object from webhook
@@ -107,6 +110,21 @@ async def process_incoming_message(message: dict, value: dict):
         message_type = message.get("type")
         
         logger.info(f"Processing message from {from_number}: type={message_type}")
+        
+        # Get or create user (auto-registration)
+        db = SessionLocal()
+        try:
+            user, is_new = get_or_create_user(db, from_number)
+            
+            if is_new:
+                logger.info(f"🎉 New user registered: {from_number} (ID: {user.id})")
+                # Send welcome message for new users
+                await send_welcome_message(from_number, user)
+        except Exception as e:
+            logger.error(f"Error with user registration: {e}")
+            user = None
+        finally:
+            db.close()
         
         # Mark message as read
         try:
@@ -234,6 +252,28 @@ async def handle_greeting(from_number: str):
     )
 
 
+async def send_welcome_message(from_number: str, user):
+    """Send welcome message to new users"""
+    welcome_message = (
+        f"🎉 *Welcome to ForBill, {user.name or 'Friend'}!*\n\n"
+        f"Your account has been created successfully!\n\n"
+        f"*Your Details:*\n"
+        f"📱 Phone: {user.phone_number}\n"
+        f"💰 Wallet: {format_currency(user.wallet_balance)}\n"
+        f"🎁 Referral Code: `{user.referral_code}`\n\n"
+        f"*What you can do:*\n"
+        f"• Buy Airtime & Data\n"
+        f"• Pay Electricity Bills\n"
+        f"• Subscribe to Cable TV\n"
+        f"• Earn referral bonuses\n\n"
+        f"Type *help* to see all commands!"
+    )
+    await whatsapp_service.send_text_message(
+        to=from_number,
+        message=welcome_message
+    )
+
+
 async def handle_help(from_number: str):
     """Send help menu"""
     help_message = (
@@ -265,17 +305,41 @@ async def handle_help(from_number: str):
 
 
 async def handle_balance_check(from_number: str):
-    """Check wallet balance (placeholder - will implement with user service)"""
-    # TODO: Implement actual balance check from database
-    await whatsapp_service.send_text_message(
-        to=from_number,
-        message=(
-            "💰 *Your Wallet*\n\n"
-            "Balance: ₦0.00\n\n"
-            "_To fund your wallet, I'll send you a virtual account number soon!_\n\n"
-            "Type 'help' for available services."
+    """Check wallet balance with real user data"""
+    db = SessionLocal()
+    try:
+        user = get_user_by_phone(db, from_number)
+        
+        if not user:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message="❌ User not found. Please send 'hi' to register."
+            )
+            return
+        
+        balance_msg = (
+            f"💰 *Your Wallet*\n\n"
+            f"Balance: *{format_currency(user.wallet_balance)}*\n"
+            f"Account Status: {'✅ Active' if user.is_active else '❌ Inactive'}\n\n"
+            f"💡 *How to fund:*\n"
+            f"Send money to your virtual account (coming soon!)\n\n"
+            f"🎁 *Referral Code:* `{user.referral_code}`\n"
+            f"Share and earn 5% on every transaction!\n\n"
+            f"Type *help* for available services."
         )
-    )
+        
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message=balance_msg
+        )
+    except Exception as e:
+        logger.error(f"Error checking balance: {e}")
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message="❌ Error checking balance. Please try again."
+        )
+    finally:
+        db.close()
 
 
 async def handle_airtime_purchase(from_number: str, parsed: dict):
@@ -397,22 +461,110 @@ async def handle_cable_subscription(from_number: str, parsed: dict):
 
 
 async def handle_transaction_history(from_number: str):
-    """Show transaction history (placeholder)"""
-    # TODO: Implement actual transaction history from database
-    await whatsapp_service.send_text_message(
-        to=from_number,
-        message=(
-            "📊 *Transaction History*\n\n"
-            "You have no transactions yet.\n\n"
-            "Start by buying airtime or data!\n\n"
-            "Type 'help' to see available services."
+    """Show transaction history with real data"""
+    db = SessionLocal()
+    try:
+        user = get_user_by_phone(db, from_number)
+        
+        if not user:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message="❌ User not found. Please send 'hi' to register."
+            )
+            return
+        
+        transactions = get_user_transactions(db, user.id, limit=5)
+        
+        if not transactions:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    "📊 *Transaction History*\n\n"
+                    "You have no transactions yet.\n\n"
+                    "Start by buying airtime or data!\n\n"
+                    "Type 'help' to see available services."
+                )
+            )
+            return
+        
+        # Format transaction history
+        history_text = "📊 *Recent Transactions*\n\n"
+        
+        for txn in transactions:
+            status_emoji = {
+                "pending": "⏳",
+                "completed": "✅",
+                "failed": "❌",
+                "cancelled": "🚫"
+            }.get(txn.status.value, "❓")
+            
+            history_text += (
+                f"{status_emoji} *{txn.transaction_type.value.upper()}*\n"
+                f"Amount: {format_currency(txn.amount)}\n"
+                f"Status: {txn.status.value.title()}\n"
+                f"Date: {txn.created_at.strftime('%b %d, %Y %I:%M %p')}\n"
+                f"Ref: {txn.reference[:12]}...\n\n"
+            )
+        
+        history_text += f"\n💰 Current Balance: *{format_currency(user.wallet_balance)}*"
+        
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message=history_text
         )
-    )
+    except Exception as e:
+        logger.error(f"Error fetching history: {e}")
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message="❌ Error fetching transaction history. Please try again."
+        )
+    finally:
+        db.close()
 
 
 async def handle_referral_info(from_number: str):
-    """Show referral information (placeholder)"""
-    # TODO: Implement actual referral info from database
+    """Show referral information with real data"""
+    db = SessionLocal()
+    try:
+        user = get_user_by_phone(db, from_number)
+        
+        if not user:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message="❌ User not found. Please send 'hi' to register."
+            )
+            return
+        
+        # Count referrals (users who used this user's referral code)
+        referral_count = db.query(User).filter(User.referred_by == user.referral_code).count()
+        
+        referral_msg = (
+            f"🎁 *Referral Program*\n\n"
+            f"*Your Referral Code:* `{user.referral_code}`\n\n"
+            f"📊 *Stats:*\n"
+            f"• Total Referrals: {referral_count}\n"
+            f"• Earnings: Coming soon!\n\n"
+            f"💰 *How it works:*\n"
+            f"1. Share your code with friends\n"
+            f"2. They register with your code\n"
+            f"3. You earn 5% on their transactions!\n\n"
+            f"*Share this message:*\n"
+            f"_Join ForBill and get instant bill payments! Use my code *{user.referral_code}* when you register._\n\n"
+            f"Type 'help' for more commands."
+        )
+        
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message=referral_msg
+        )
+    except Exception as e:
+        logger.error(f"Error fetching referral info: {e}")
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message="❌ Error fetching referral info. Please try again."
+        )
+    finally:
+        db.close()
     await whatsapp_service.send_text_message(
         to=from_number,
         message=(
