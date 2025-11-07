@@ -13,7 +13,13 @@ fi
 echo "🔍 Checking environment variables..."
 if [ -z "$DATABASE_URL" ]; then
     echo "❌ ERROR: DATABASE_URL is not set!"
-    echo "Please add PostgreSQL service in Railway dashboard"
+    echo ""
+    echo "SOLUTION:"
+    echo "1. Go to your Railway project dashboard"
+    echo "2. Click '+ New' → 'Database' → 'Add PostgreSQL'"
+    echo "3. Railway will automatically set DATABASE_URL"
+    echo "4. Redeploy will happen automatically"
+    echo ""
     exit 1
 fi
 
@@ -22,57 +28,21 @@ if [ -z "$PORT" ]; then
     export PORT=8000
 fi
 
-echo "✅ Environment variables OK"
+echo "✅ DATABASE_URL is set"
+echo "✅ PORT: $PORT"
 
-# Wait for database to be ready
-echo "⏳ Waiting for database..."
-python -c "
-import time
-import sys
-import os
-
-try:
-    import asyncpg
-    import asyncio
-except ImportError as e:
-    print(f'❌ Missing required package: {e}')
-    sys.exit(1)
-
-async def wait_for_db():
-    max_retries = 30
-    retry_interval = 2
-    
-    for i in range(max_retries):
-        try:
-            conn = await asyncpg.connect(os.getenv('DATABASE_URL'))
-            await conn.close()
-            print('✅ Database is ready!')
-            return True
-        except Exception as e:
-            if i < max_retries - 1:
-                print(f'⏳ Database not ready, retrying in {retry_interval}s... ({i+1}/{max_retries})')
-                await asyncio.sleep(retry_interval)
-            else:
-                print(f'❌ Database connection failed after {max_retries} attempts')
-                print(f'Error: {str(e)}')
-                raise
-
-asyncio.run(wait_for_db())
-"
-
-if [ $? -ne 0 ]; then
-    echo "❌ Database connection check failed!"
-    exit 1
-fi
-
-# Run database migrations
+# Run database migrations (Railway handles connection timing)
 echo "🔄 Running database migrations..."
-alembic upgrade head
-
-if [ $? -ne 0 ]; then
+alembic upgrade head || {
     echo "❌ Database migrations failed!"
+    echo "This usually means:"
+    echo "  - DATABASE_URL format is incorrect"
+    echo "  - PostgreSQL service is not running"
+    echo "  - Network connectivity issue"
     exit 1
-fi
+}
+
+echo "✅ Migrations completed successfully"
 
 # Start the application
 echo "✅ Starting uvicorn server on port $PORT..."
