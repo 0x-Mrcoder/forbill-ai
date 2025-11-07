@@ -12,7 +12,6 @@ class TopUpMateService:
     def __init__(self):
         self.base_url = settings.TOPUPMATE_BASE_URL
         self.api_key = settings.TOPUPMATE_API_KEY
-        self.public_key = settings.TOPUPMATE_PUBLIC_KEY
         
     async def _make_request(
         self,
