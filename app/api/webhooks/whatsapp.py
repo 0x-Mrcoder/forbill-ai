@@ -6,12 +6,14 @@ from loguru import logger
 from app.config import settings
 from app.services.whatsapp import whatsapp_service
 from app.services.commands import parse_command, CommandType
+from app.services.payrant import payrant_service
 from app.models.webhook_log import WebhookLog, WebhookSource
 from app.models.user import User
 from app.database import SessionLocal
 from app.crud.user import get_or_create_user, get_user_by_phone, get_user_transactions
 from app.utils.helpers import format_currency
 import json
+import asyncio
 
 router = APIRouter()
 
@@ -272,6 +274,59 @@ async def send_welcome_message(from_number: str, user):
         to=from_number,
         message=welcome_message
     )
+    
+    # Create virtual account in background
+    asyncio.create_task(create_virtual_account_for_user(user))
+
+
+async def create_virtual_account_for_user(user):
+    """Create virtual account for user (background task)"""
+    try:
+        db = SessionLocal()
+        try:
+            # Check if already has account
+            if user.virtual_account_number:
+                logger.info(f"User {user.id} already has virtual account")
+                return
+            
+            # Create account reference
+            account_reference = f"FORBILL-{user.id}-{user.phone_number[-4:]}"
+            
+            # Create virtual account
+            result = await payrant_service.create_virtual_account(
+                customer_name=user.name or user.phone_number,
+                customer_email=f"{user.phone_number}@forbill.app",
+                customer_phone=user.phone_number,
+                account_reference=account_reference
+            )
+            
+            if result:
+                # Update user with account details
+                user.virtual_account_number = result.get("account_number")
+                user.virtual_account_name = result.get("account_name")
+                user.virtual_account_bank = result.get("bank_name", "Payrant")
+                db.commit()
+                
+                logger.info(f"Virtual account created for user {user.id}")
+                
+                # Send account details
+                account_msg = (
+                    f"🏦 *Your Virtual Account*\n\n"
+                    f"Bank: {user.virtual_account_bank}\n"
+                    f"Account Number: *{user.virtual_account_number}*\n"
+                    f"Account Name: {user.virtual_account_name}\n\n"
+                    f"💡 Transfer any amount to fund your wallet!\n"
+                    f"Your account will be credited instantly."
+                )
+                
+                await whatsapp_service.send_text_message(
+                    to=user.phone_number,
+                    message=account_msg
+                )
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"Error creating virtual account: {e}")
 
 
 async def handle_help(from_number: str):
@@ -317,12 +372,24 @@ async def handle_balance_check(from_number: str):
             )
             return
         
+        # Include virtual account details if available
+        funding_info = ""
+        if user.virtual_account_number and user.virtual_account_name:
+            funding_info = (
+                f"*Virtual Account*\n"
+                f"Bank: {user.virtual_account_bank or 'Payrant'}\n"
+                f"Account: {user.virtual_account_number}\n"
+                f"Name: {user.virtual_account_name}\n\n"
+                f"Transfer any amount to fund your wallet!\n\n"
+            )
+        else:
+            funding_info = "💡 Setting up your virtual account...\n\n"
+        
         balance_msg = (
             f"💰 *Your Wallet*\n\n"
             f"Balance: *{format_currency(user.wallet_balance)}*\n"
             f"Account Status: {'✅ Active' if user.is_active else '❌ Inactive'}\n\n"
-            f"💡 *How to fund:*\n"
-            f"Send money to your virtual account (coming soon!)\n\n"
+            f"{funding_info}"
             f"🎁 *Referral Code:* `{user.referral_code}`\n"
             f"Share and earn 5% on every transaction!\n\n"
             f"Type *help* for available services."
