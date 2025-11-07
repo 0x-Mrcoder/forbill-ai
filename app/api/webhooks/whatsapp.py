@@ -744,44 +744,426 @@ async def handle_data_purchase(from_number: str, parsed: dict):
 
 async def handle_electricity_payment(from_number: str, parsed: dict):
     """Handle electricity bill payment request"""
-    amount = parsed.get("amount")
-    
-    if not amount:
+    db = SessionLocal()
+    try:
+        # Get user
+        user = get_user_by_phone(db, from_number)
+        if not user:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message="❌ Please send 'hi' to register first."
+            )
+            return
+        
+        amount = parsed.get("amount")
+        meter_number = parsed.get("meter_number")
+        disco = parsed.get("disco", "IKEDC")  # Default disco
+        
+        if not amount:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    "💡 *Electricity Payment*\n\n"
+                    "Please provide:\n"
+                    "• Amount (₦1,000 - ₦100,000)\n"
+                    "• Meter number\n\n"
+                    "*Examples:*\n"
+                    "• Buy 5000 electricity for 1234567890\n"
+                    "• Pay 10000 light 9876543210\n\n"
+                    "*Supported:* IKEDC, EKEDC, AEDC, PHED, etc."
+                )
+            )
+            return
+        
+        if not meter_number:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    "💡 *Meter Number Required*\n\n"
+                    f"You want to buy {format_currency(amount)} electricity.\n\n"
+                    "Please provide your meter number:\n"
+                    "Example: 'Buy 5000 electricity for 1234567890'"
+                )
+            )
+            return
+        
+        # Check wallet balance
+        balance_check = wallet_service.check_sufficient_balance(db, user.id, amount)
+        if not balance_check["has_sufficient_balance"]:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"❌ *Insufficient Balance*\n\n"
+                    f"Required: {format_currency(amount)}\n"
+                    f"Available: {format_currency(balance_check['current_balance'])}\n"
+                    f"Shortfall: {balance_check['shortfall_formatted']}\n\n"
+                    f"💡 Type *balance* to fund your wallet"
+                )
+            )
+            return
+        
+        # Verify meter number first
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message=f"🔍 Verifying meter number {meter_number}..."
+        )
+        
+        verification = await topupmate_service.verify_meter_number(
+            meter_number=meter_number,
+            disco=disco,
+            meter_type="prepaid"
+        )
+        
+        if not verification.get("success"):
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"❌ *Invalid Meter Number*\n\n"
+                    f"{verification.get('message', 'Unable to verify meter')}\n\n"
+                    f"Please check the meter number and try again."
+                )
+            )
+            return
+        
+        customer_name = verification.get("customer_name", "Customer")
+        
+        # Send processing message
         await whatsapp_service.send_text_message(
             to=from_number,
             message=(
-                "💡 *Electricity Payment*\n\n"
-                "How much would you like to pay?\n\n"
-                "Example: 'Buy 5000 electricity'\n\n"
-                "Min: ₦100"
+                f"⏳ *Processing Electricity Payment...*\n\n"
+                f"Customer: {customer_name}\n"
+                f"Meter: {meter_number}\n"
+                f"Amount: {format_currency(amount)}\n"
+                f"Disco: {disco}\n\n"
+                f"Please wait..."
             )
         )
-        return
-    
-    await whatsapp_service.send_text_message(
-        to=from_number,
-        message=(
-            f"💡 *Electricity Payment*\n\n"
-            f"Amount: ₦{amount:,}\n\n"
-            f"_Coming soon! We're setting up electricity payments._\n\n"
-            f"Type 'help' for available commands."
+        
+        # Debit wallet
+        transaction = wallet_service.debit_wallet(
+            db=db,
+            user_id=user.id,
+            amount=amount,
+            description=f"Electricity - {meter_number}",
+            transaction_type=TransactionType.ELECTRICITY
         )
-    )
+        
+        # Store transaction details
+        transaction.meter_number = meter_number
+        transaction.service_provider = "TopUpMate"
+        db.commit()
+        
+        # Purchase electricity token
+        result = await topupmate_service.buy_electricity(
+            meter_number=meter_number,
+            amount=amount,
+            disco=disco,
+            meter_type="prepaid",
+            customer_phone=from_number
+        )
+        
+        if result.get("success"):
+            # Update transaction status
+            wallet_service.update_transaction_status(
+                db=db,
+                transaction_id=transaction.id,
+                status=TransactionStatus.COMPLETED,
+                provider_response=str(result),
+                provider_reference=result.get("provider_reference")
+            )
+            
+            # Store token
+            transaction.token = result.get("token")
+            db.commit()
+            
+            token = result.get("token", "N/A")
+            units = result.get("units", "N/A")
+            
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"✅ *Electricity Purchase Successful!*\n\n"
+                    f"Customer: {customer_name}\n"
+                    f"Meter: {meter_number}\n"
+                    f"Amount: {format_currency(amount)}\n"
+                    f"Units: {units} kWh\n\n"
+                    f"🔑 *Token:* `{token}`\n\n"
+                    f"Reference: {transaction.reference}\n"
+                    f"New Balance: {format_currency(user.wallet_balance)}\n\n"
+                    f"Thank you for using ForBill! 💚"
+                )
+            )
+        else:
+            # Refund on failure
+            wallet_service.refund_transaction(
+                db=db,
+                transaction_id=transaction.id,
+                reason=result.get("message", "Purchase failed")
+            )
+            
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"❌ *Electricity Purchase Failed*\n\n"
+                    f"{result.get('message')}\n\n"
+                    f"Your wallet has been refunded.\n"
+                    f"Reference: {transaction.reference}\n\n"
+                    f"Please try again or contact support."
+                )
+            )
+    
+    except Exception as e:
+        logger.error(f"Error processing electricity payment: {str(e)}")
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message="❌ An error occurred. Please try again later."
+        )
+    finally:
+        db.close()
 
 
 async def handle_cable_subscription(from_number: str, parsed: dict):
     """Handle cable TV subscription request"""
-    provider = parsed.get("provider", "Cable TV")
-    
-    await whatsapp_service.send_text_message(
-        to=from_number,
-        message=(
-            f"📺 *{provider.upper()} Subscription*\n\n"
-            f"_Coming soon! We're setting up cable TV payments._\n\n"
-            f"Supported: DSTV, GOTV, Startimes\n\n"
-            f"Type 'help' for available commands."
+    db = SessionLocal()
+    try:
+        # Get user
+        user = get_user_by_phone(db, from_number)
+        if not user:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message="❌ Please send 'hi' to register first."
+            )
+            return
+        
+        provider = parsed.get("provider")
+        smartcard_number = parsed.get("smartcard_number")
+        
+        if not provider:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    "📺 *Cable TV Subscription*\n\n"
+                    "Which service would you like to subscribe to?\n\n"
+                    "*Examples:*\n"
+                    "• Pay DSTV for 1234567890\n"
+                    "• Subscribe GOTV 9876543210\n"
+                    "• Renew Startimes 5555555555\n\n"
+                    "*Supported:* DSTV, GOTV, Startimes"
+                )
+            )
+            return
+        
+        if not smartcard_number:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"📺 *{provider.upper()} Subscription*\n\n"
+                    f"Please provide your smartcard/IUC number:\n\n"
+                    f"Example: 'Pay {provider} for 1234567890'"
+                )
+            )
+            return
+        
+        # Verify smartcard first
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message=f"🔍 Verifying {provider.upper()} smartcard {smartcard_number}..."
         )
-    )
+        
+        verification = await topupmate_service.verify_smartcard(
+            smartcard_number=smartcard_number,
+            service_type=provider
+        )
+        
+        if not verification.get("success"):
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"❌ *Invalid Smartcard Number*\n\n"
+                    f"{verification.get('message', 'Unable to verify smartcard')}\n\n"
+                    f"Please check the number and try again."
+                )
+            )
+            return
+        
+        customer_name = verification.get("customer_name", "Customer")
+        current_bouquet = verification.get("current_bouquet", "N/A")
+        
+        # Get available packages
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message=f"📺 Fetching {provider.upper()} packages..."
+        )
+        
+        packages_result = await topupmate_service.get_cable_packages(service_type=provider)
+        
+        if not packages_result.get("success") or not packages_result.get("packages"):
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=f"❌ Unable to fetch {provider.upper()} packages. Please try again."
+            )
+            return
+        
+        packages = packages_result["packages"]
+        
+        # Format packages list
+        packages_list = f"📺 *{provider.upper()} Packages*\n\n"
+        packages_list += f"Customer: {customer_name}\n"
+        packages_list += f"Smartcard: {smartcard_number}\n"
+        packages_list += f"Current: {current_bouquet}\n\n"
+        packages_list += "*Available Packages:*\n"
+        
+        for idx, pkg in enumerate(packages[:10], 1):  # Show first 10
+            pkg_name = pkg.get("name", "Unknown")
+            pkg_price = pkg.get("price", 0)
+            packages_list += f"{idx}. {pkg_name} - {format_currency(pkg_price)}\n"
+        
+        packages_list += f"\n💡 To subscribe, reply with the package number (1-{min(10, len(packages))})"
+        
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message=packages_list
+        )
+        
+        # Store state for package selection (in a real app, use session storage)
+        # For now, we'll just show the message
+        # TODO: Implement state management for multi-step flows
+        
+    except Exception as e:
+        logger.error(f"Error processing cable subscription: {str(e)}")
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message="❌ An error occurred. Please try again later."
+        )
+    finally:
+        db.close()
+
+
+async def handle_cable_purchase(from_number: str, smartcard_number: str, package_code: str, provider: str):
+    """Complete cable TV purchase after package selection"""
+    db = SessionLocal()
+    try:
+        user = get_user_by_phone(db, from_number)
+        if not user:
+            return
+        
+        # Get package details
+        packages_result = await topupmate_service.get_cable_packages(service_type=provider)
+        if not packages_result.get("success"):
+            return
+        
+        packages = packages_result["packages"]
+        selected_package = next((p for p in packages if p.get("code") == package_code), None)
+        
+        if not selected_package:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message="❌ Invalid package selected."
+            )
+            return
+        
+        package_name = selected_package["name"]
+        package_amount = selected_package["price"]
+        
+        # Check wallet balance
+        balance_check = wallet_service.check_sufficient_balance(db, user.id, package_amount)
+        if not balance_check["has_sufficient_balance"]:
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"❌ *Insufficient Balance*\n\n"
+                    f"Package: {package_name}\n"
+                    f"Required: {format_currency(package_amount)}\n"
+                    f"Available: {format_currency(balance_check['current_balance'])}\n"
+                    f"Shortfall: {balance_check['shortfall_formatted']}\n\n"
+                    f"💡 Type *balance* to fund your wallet"
+                )
+            )
+            return
+        
+        # Send processing message
+        await whatsapp_service.send_text_message(
+            to=from_number,
+            message=(
+                f"⏳ *Processing {provider.upper()} Subscription...*\n\n"
+                f"Package: {package_name}\n"
+                f"Amount: {format_currency(package_amount)}\n"
+                f"Smartcard: {smartcard_number}\n\n"
+                f"Please wait..."
+            )
+        )
+        
+        # Debit wallet
+        transaction = wallet_service.debit_wallet(
+            db=db,
+            user_id=user.id,
+            amount=package_amount,
+            description=f"{provider.upper()} - {package_name}",
+            transaction_type=TransactionType.CABLE_TV
+        )
+        
+        # Store transaction details
+        transaction.smartcard_number = smartcard_number
+        transaction.service_provider = "TopUpMate"
+        db.commit()
+        
+        # Purchase cable TV subscription
+        result = await topupmate_service.buy_cabletv(
+            smartcard_number=smartcard_number,
+            package_code=package_code,
+            service_type=provider,
+            customer_phone=from_number
+        )
+        
+        if result.get("success"):
+            # Update transaction status
+            wallet_service.update_transaction_status(
+                db=db,
+                transaction_id=transaction.id,
+                status=TransactionStatus.COMPLETED,
+                provider_response=str(result),
+                provider_reference=result.get("provider_reference")
+            )
+            
+            renewal_date = result.get("renewal_date", "N/A")
+            
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"✅ *{provider.upper()} Subscription Successful!*\n\n"
+                    f"Package: {package_name}\n"
+                    f"Amount: {format_currency(package_amount)}\n"
+                    f"Smartcard: {smartcard_number}\n"
+                    f"Renewal: {renewal_date}\n\n"
+                    f"Reference: {transaction.reference}\n"
+                    f"New Balance: {format_currency(user.wallet_balance)}\n\n"
+                    f"Thank you for using ForBill! 💚"
+                )
+            )
+        else:
+            # Refund on failure
+            wallet_service.refund_transaction(
+                db=db,
+                transaction_id=transaction.id,
+                reason=result.get("message", "Purchase failed")
+            )
+            
+            await whatsapp_service.send_text_message(
+                to=from_number,
+                message=(
+                    f"❌ *{provider.upper()} Subscription Failed*\n\n"
+                    f"{result.get('message')}\n\n"
+                    f"Your wallet has been refunded.\n"
+                    f"Reference: {transaction.reference}\n\n"
+                    f"Please try again or contact support."
+                )
+            )
+    
+    except Exception as e:
+        logger.error(f"Error completing cable purchase: {str(e)}")
+    finally:
+        db.close()
 
 
 async def handle_transaction_history(from_number: str):
