@@ -4,6 +4,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 import sys
+import os
+from pathlib import Path
 
 from app.config import settings
 
@@ -14,12 +16,19 @@ logger.add(
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
     level="DEBUG" if settings.DEBUG else "INFO"
 )
-logger.add(
-    "logs/forbill_{time:YYYY-MM-DD}.log",
-    rotation="00:00",
-    retention="30 days",
-    level="INFO"
-)
+
+# Only add file logging if we can create the logs directory
+try:
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    logger.add(
+        "logs/forbill_{time:YYYY-MM-DD}.log",
+        rotation="00:00",
+        retention="30 days",
+        level="INFO"
+    )
+except (PermissionError, OSError) as e:
+    logger.warning(f"Could not create logs directory, using stdout only: {e}")
 
 # Create FastAPI app
 app = FastAPI(
